@@ -289,21 +289,66 @@ async def job_aviso_pre_reset(context: ContextTypes.DEFAULT_TYPE):
         text="🏆 Atenção! Em 60 segundos serão anunciados os TOP 3 vencedores da semana!"
     )
 
-# ===== JOB: ANUNCIAR TOP 3 + RESET SEMANAL =====
-async def job_reset_semanal(context: ContextTypes.DEFAULT_TYPE):
-    top = get_sorted_records(limit=3)
+from datetime import datetime, time
 
-    # Anuncia top 3 antes de resetar
-    if top and any(safe_int(u["points"]) > 0 for u in top):
-        medals = ["🥇", "🥈", "🥉"]
-        msg = "🏆 TOP 3 da semana:\n"
-        for i, user in enumerate(top):
-            msg += f"{medals[i]} @{user['username']} — {user['points']} pontos\n"
-        await context.bot.send_message(chat_id=GROUP_ID, text=msg)
+# ===== RESET SEMANAL COMPLETO =====
+async def job_reset_semanal(context):
+    print("🔄 RESET SEMANAL EXECUTADO")
 
-    # Reseta pontos
     s = get_sheet()
     records = s.get_all_records()
+
+    # ===== PROTEÇÃO: evitar reset duplicado =====
+    current_week = datetime.now().strftime("%Y-%W")
+    last_reset = context.bot_data.get("last_reset")
+
+    if last_reset == current_week:
+        print("⚠️ Reset já realizado essa semana")
+        return
+
+    # ===== SALVAR HISTÓRICO =====
+    try:
+        sheet_name = f"Semana_{current_week}"
+        spreadsheet = s.spreadsheet
+
+        try:
+            history_sheet = spreadsheet.worksheet(sheet_name)
+        except:
+            history_sheet = spreadsheet.add_worksheet(
+                title=sheet_name,
+                rows="100",
+                cols="10"
+            )
+
+        headers = ["user_id", "username", "invite_link", "points", "join_date", "valid"]
+        history_sheet.append_row(headers)
+
+        for row in records:
+            history_sheet.append_row([
+                row.get("user_id"),
+                row.get("username"),
+                row.get("invite_link"),
+                row.get("points"),
+                row.get("join_date"),
+                row.get("valid")
+            ])
+
+    except Exception as e:
+        print("Erro ao salvar histórico:", e)
+
+    # ===== TOP 3 =====
+    top = get_sorted_records(limit=3)
+
+    if top and any(int(u.get("points") or 0) > 0 for u in top):
+        medals = ["🥇", "🥈", "🥉"]
+        msg = "🏆 TOP 3 da semana:\n"
+
+        for i, user in enumerate(top):
+            msg += f"{medals[i]} @{user['username']} — {user['points']} pontos\n"
+
+        await context.bot.send_message(chat_id=GROUP_ID, text=msg)
+
+    # ===== RESET DOS PONTOS =====
     for i, row in enumerate(records, start=2):
         s.update_cell(i, 4, 0)
 
@@ -312,6 +357,29 @@ async def job_reset_semanal(context: ContextTypes.DEFAULT_TYPE):
         text="🔄 Ranking resetado! Nova semana, novas chances 💸"
     )
 
+    # salva controle
+    context.bot_data["last_reset"] = current_week
+
+
+# ===== AGENDAMENTO =====
+def setup_jobs(application):
+    application.job_queue.run_daily(
+        job_reset_semanal,
+        time=time(hour=23, minute=59),
+        days=(6,)  # domingo
+    )
+
+
+# ===== FAILSAFE AO INICIAR =====
+async def check_reset_on_start(application):
+    print("🔍 Verificando necessidade de reset...")
+
+    current_week = datetime.now().strftime("%Y-%W")
+    last_reset = application.bot_data.get("last_reset")
+
+    if last_reset != current_week:
+        print("⚠️ Reset pendente — executando agora")
+        await job_reset_semanal(application)
 # ===== MEUS PONTOS =====
 async def meuspontos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -441,6 +509,9 @@ except KeyError:
     raise
 
 app = ApplicationBuilder().token(_token).build()
+
+setup_jobs(app)
+app.post_init = check_reset_on_start
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("ranking", ranking))
